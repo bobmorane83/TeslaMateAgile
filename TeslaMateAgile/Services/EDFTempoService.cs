@@ -3,7 +3,6 @@ using Microsoft.Extensions.Options;
 using System.Globalization;
 using System.Net.Http;
 using System.Text.Json;
-using System.Text.Json.Serialization;
 using System.Threading.Tasks;
 using TeslaMateAgile.Data;
 using TeslaMateAgile.Data.Options;
@@ -18,10 +17,9 @@ namespace TeslaMateAgile.Services
         private readonly HttpClient _client;
         private readonly EDFTempoOptions _options;
         private readonly ILogger _logger;
+        private readonly TimeZoneInfo _frenchTimeZone = TimeZoneInfo.FindSystemTimeZoneById("Central European Standard Time");
 
-        private readonly TimeZoneInfo frenchTimeZone = TimeZoneInfo.FindSystemTimeZoneById("Central European Standard Time");
-
-        public EDFTempoService(HttpClient client, IOptions<EDFTempoOptions> options, ILogger<HomeAssistantService> logger)
+        public EDFTempoService(HttpClient client, IOptions<EDFTempoOptions> options, ILogger<EDFTempoService> logger)
         {
             _client = client;
             _options = options.Value;
@@ -30,40 +28,20 @@ namespace TeslaMateAgile.Services
 
         public async Task<IEnumerable<Price>> GetPriceData(DateTimeOffset from, DateTimeOffset to)
         {
-
-            from = TimeZoneInfo.ConvertTime(from, frenchTimeZone);
-            to = TimeZoneInfo.ConvertTime(to, frenchTimeZone);
+            from = TimeZoneInfo.ConvertTime(from, _frenchTimeZone);
+            to = TimeZoneInfo.ConvertTime(to, _frenchTimeZone);
 
             _logger.LogDebug("EDF : Range - {from} -> {to}", from, to);
 
-            string days = "";
-            // We need also data of previous day, as the ending off peak period end at 6AM the charge start day
-            DateTimeOffset currentDate = from.Date.AddDays(-1);
-
-            // Create URL
-            while (currentDate <= to.Date)
-            {
-                days += $"dateJour[]={currentDate:yyyy-MM-dd}&";
-                currentDate = currentDate.AddDays(1);
-            }
-
-            string url = $"{_options.BaseUrl}?{days}";
+            var days = GenerateDaysQuery(from, to);
+            var url = $"{_options.BaseUrl}?{days}";
 
             _logger.LogDebug("EDF : URL: {url}", url);
-
-            HttpResponseMessage response = await _client.GetAsync(url);
-            response.EnsureSuccessStatusCode();
-            string jsonResponse = await response.Content.ReadAsStringAsync();
-
+            var jsonResponse = await _client.GetStringAsync(url);
             _logger.LogDebug("EDF Response: {jsonResponse}", jsonResponse);
 
-            List<TempoDay> data = JsonSerializer.Deserialize<List<TempoDay>>(jsonResponse);
-
-            if (data == null || data.Count == 0)
-            {
-                throw new Exception("Failed to retrieve or deserialize EDF Tempo API response");
-            }
-
+            var data = JsonSerializer.Deserialize<List<TempoDay>>(jsonResponse) ?? throw new Exception("Failed to retrieve or deserialize EDF Tempo API response");
+            
             foreach (var item in data)
             {
                 _logger.LogDebug("EDF : TempoDay - Date: {item.dateJour}, Color: {item.codeJour}", item.dateJour, item.codeJour);
@@ -72,92 +50,60 @@ namespace TeslaMateAgile.Services
             return GenerateSchedule(data, from, to);
         }
 
-        private IEnumerable<Price> GenerateSchedule(List<TempoDay> data, DateTimeOffset fromDatetime, DateTimeOffset toDatetime)
+        private static string GenerateDaysQuery(DateTimeOffset from, DateTimeOffset to)
         {
-            List<Price> schedList = new List<Price>();
-            List<Tuple<DateTimeOffset, Tuple<TimeSpan, TimeSpan, int, int>, int>> schedule = new List<Tuple<DateTimeOffset, Tuple<TimeSpan, TimeSpan, int, int>, int>>();
-
-            // Period Tuple : Start DateTime, End DateTime, color day associated (-1 = previous day), PeakHours (0=Off peak)
-            List<Tuple<TimeSpan, TimeSpan, int, int>> segments = new List<Tuple<TimeSpan, TimeSpan, int, int>>()
+            var query = new List<string>();
+            for (var date = from.Date.AddDays(-1); date <= to.Date; date = date.AddDays(1))
             {
-                new Tuple<TimeSpan, TimeSpan, int, int>(TimeSpan.FromHours(0)+TimeSpan.FromMinutes(0)+TimeSpan.FromSeconds(0), TimeSpan.FromHours(5)+TimeSpan.FromMinutes(59)+TimeSpan.FromSeconds(59)+TimeSpan.FromMilliseconds(999), -1, 0),
-                new Tuple<TimeSpan, TimeSpan, int, int>(TimeSpan.FromHours(6)+TimeSpan.FromMinutes(0)+TimeSpan.FromSeconds(0), TimeSpan.FromHours(21)+TimeSpan.FromMinutes(59)+TimeSpan.FromSeconds(59)+TimeSpan.FromMilliseconds(999), 0, 1),
-                new Tuple<TimeSpan, TimeSpan, int, int>(TimeSpan.FromHours(22)+TimeSpan.FromMinutes(0)+TimeSpan.FromSeconds(0), TimeSpan.FromHours(23)+TimeSpan.FromMinutes(59)+TimeSpan.FromSeconds(59)+TimeSpan.FromMilliseconds(999), 0, 0)
+                query.Add($"dateJour[]={date:yyyy-MM-dd}");
+            }
+            return string.Join("&", query);
+        }
+
+        private IEnumerable<Price> GenerateSchedule(List<TempoDay> data, DateTimeOffset from, DateTimeOffset to)
+        {
+            var segments = new List<(TimeSpan Start, TimeSpan End, int DayOffset, int Peak)>
+            {
+                (TimeSpan.FromHours(0), TimeSpan.FromHours(6), -1, 0),
+                (TimeSpan.FromHours(6), TimeSpan.FromHours(22), 0, 1),
+                (TimeSpan.FromHours(22), TimeSpan.FromDays(1), 0, 0)
             };
 
-            // Price for each period
-            Dictionary<int, decimal> prices = new Dictionary<int, decimal>()
+            var prices = new Dictionary<int, decimal>
             {
-                {0, _options.BLUE_HC}, {1, _options.BLUE_HP}, {2, _options.WHITE_HC}, {3, _options.WHITE_HP}, {4, _options.RED_HC}, {5, _options.RED_HP}
+                { 0, _options.BLUE_HC }, { 1, _options.BLUE_HP },
+                { 2, _options.WHITE_HC }, { 3, _options.WHITE_HP },
+                { 4, _options.RED_HC }, { 5, _options.RED_HP }
             };
 
-            // For each day, add schedule (Peak/Off peak hours)
-            for (int day = 1; day < data.Count; day++)
+            var schedule = new List<(DateTimeOffset Date, TimeSpan Start, TimeSpan End, int Code)>();
+            for (int i = 1; i < data.Count; i++)
             {
-                DateTime dateLocal = DateTime.ParseExact(data[day].dateJour, "yyyy-MM-dd", CultureInfo.InvariantCulture);
-                DateTimeOffset date = new DateTimeOffset(dateLocal, frenchTimeZone.GetUtcOffset(dateLocal));
-
-                foreach (var segment in segments)
+                var date = DateTimeOffset.ParseExact(data[i].dateJour, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal);
+                foreach (var (start, end, dayOffset, peak) in segments)
                 {
-                    int codeJour = data[day + segment.Item3].codeJour;
-                    schedule.Add(new Tuple<DateTimeOffset, Tuple<TimeSpan, TimeSpan, int, int>, int>(date, segment, codeJour));
+                    int code = data[i + dayOffset].codeJour;
+                    schedule.Add((date, start, end, code * 2 + peak));
                 }
             }
 
-            // When have we charged ?
-            int startSchedule = 0, stopSchedule = 0;
+            return ExtractPriceSchedule(schedule, from, to, prices);
+        }
 
-            for (int i = 0; i < schedule.Count; i++)
+        private IEnumerable<Price> ExtractPriceSchedule(List<(DateTimeOffset Date, TimeSpan Start, TimeSpan End, int Code)> schedule, DateTimeOffset from, DateTimeOffset to, Dictionary<int, decimal> prices)
+        {
+            var schedList = new List<Price>();
+            foreach (var (date, start, end, code) in schedule)
             {
-                if (fromDatetime.Date == schedule[i].Item1.Date && fromDatetime.TimeOfDay >= schedule[i].Item2.Item1 && fromDatetime.TimeOfDay <= schedule[i].Item2.Item2)
-                {
-                    startSchedule = i;
-                }
-
-                if (toDatetime.Date == schedule[i].Item1.Date && toDatetime.TimeOfDay >= schedule[i].Item2.Item1 && toDatetime.TimeOfDay <= schedule[i].Item2.Item2)
-                {
-                    stopSchedule = i;
-                }
+                var startTime = date.Add(start);
+                var endTime = date.Add(end);
+                if (startTime >= to || endTime <= from) continue;
+                schedList.Add(new Price { ValidFrom = startTime.ToUniversalTime(), ValidTo = endTime.ToUniversalTime(), Value = prices[code] });
             }
-
-            _logger.LogDebug("EDF : startSchedule : {startSchedule}, stopSchedule : {stopSchedule}", startSchedule, stopSchedule);
-
-            // Get price
-            for (int iter = startSchedule; iter <= stopSchedule; iter++)
-            {
-                decimal price = prices[(schedule[iter].Item3 - 1) * 2 + schedule[iter].Item2.Item4];
-
-                if (iter == startSchedule && iter == stopSchedule)
-                {
-                    schedList.Add(new Price { ValidFrom = fromDatetime.ToUniversalTime(), ValidTo = toDatetime.ToUniversalTime(), Value = price });
-                    break;
-                }
-
-                if (iter == startSchedule)
-                {
-                    schedList.Add(new Price { ValidFrom = fromDatetime.ToUniversalTime(), ValidTo = (schedule[iter].Item1.Add(schedule[iter].Item2.Item2)).ToUniversalTime(), Value = price });
-                    continue;
-                }
-
-                if (iter == stopSchedule)
-                {
-                    schedList.Add(new Price { ValidFrom = (schedule[iter].Item1.Add(schedule[iter].Item2.Item1)).ToUniversalTime(), ValidTo = toDatetime.ToUniversalTime(), Value = price });
-                    continue;
-                }
-
-                schedList.Add(new Price { ValidFrom = (schedule[iter].Item1.Add(schedule[iter].Item2.Item1)).ToUniversalTime(), ValidTo = (schedule[iter].Item1.Add(schedule[iter].Item2.Item2)).ToUniversalTime(), Value = price });
-            }
-
-            foreach (var item in schedList)
-            {
-                _logger.LogDebug("EDF : Price: {item.ValidFrom}, {item.ValidTo}, {item.Value}", item.ValidFrom, item.ValidTo, item.Value);
-            }
-
             return schedList;
         }
     }
 
-    // JSON answer format of service provider
     public class TempoDay
     {
         public string dateJour { get; set; }
